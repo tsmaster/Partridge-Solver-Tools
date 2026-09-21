@@ -86,25 +86,40 @@ def pick_most_recently_started(running):
     return os.path.join(SOLUTIONS_DIR, basename), basename, pid
 
 
-def build_grid(soln):
-    grid = [[0] * 45 for _ in range(45)]
+# How much darker a tile's outer ring of cells is than its own interior fill - purely a matter
+# of taste, easy to tune: closer to 1.0 is a subtler seam, closer to 0.0 is a bolder outline.
+BORDER_DARKEN_FACTOR = 0.6
+
+
+def darken(color):
+    return tuple(max(0, int(c * BORDER_DARKEN_FACTOR)) for c in color)
+
+
+def build_color_grid(soln):
+    """Returns a 45x45 grid of RGB colors: each tile's outer ring of cells is darkened relative
+    to its own interior fill, so two adjacent tiles of the same size - and thus the same base
+    color - still show a visible seam between them instead of blending into one blob."""
+    grid = [[None] * 45 for _ in range(45)]
     for loc in soln.piece_locations:
+        fill = COLORS[loc.sz]
+        border = darken(fill)
         for dx in range(loc.sz):
             for dy in range(loc.sz):
-                grid[loc.y + dy][loc.x + dx] = loc.sz
+                on_edge = dx in (0, loc.sz - 1) or dy in (0, loc.sz - 1)
+                grid[loc.y + dy][loc.x + dx] = border if on_edge else fill
     return grid
 
 
 def render_grid(buf):
     soln = solution.make_solution_from_lines(buf)
-    grid = build_grid(soln)
+    grid = build_color_grid(soln)
     lines = []
     for y in range(0, 45, 2):
         chars = []
         for x in range(45):
-            top = COLORS[grid[y][x]]
+            top = grid[y][x]
             if y + 1 < 45:
-                bottom = COLORS[grid[y + 1][x]]
+                bottom = grid[y + 1][x]
                 chars.append(f"\033[38;2;{top[0]};{top[1]};{top[2]}m"
                              f"\033[48;2;{bottom[0]};{bottom[1]};{bottom[2]}m{UPPER_HALF_BLOCK}")
             else:
