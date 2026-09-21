@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import solution
 import splitlog
@@ -35,6 +35,11 @@ DEFAULT_SOLUTION_PATTERNS = [
 ]
 REFRESH_INTERVAL = 2.0
 SOLUTION_SCAN_INTERVAL = 60.0
+
+# Matt Parker's cited total (see ../notes.txt): 352,072 "L" + 1,303,584 "I" + 74,624 other.
+# Flagged there as unverified - our own nsolver run on the smaller n=8 case didn't match his
+# claimed counts - so this is a rough finish line, not a confirmed authoritative total.
+TARGET_SOLUTIONS = 1_730_280
 
 LOG_ARG_RE = re.compile(r"--log=Solutions/(\S+)")
 
@@ -214,6 +219,37 @@ def format_rate(rate_info):
     return f"average rate: {rate:.3f} solutions/sec (over {span_str}, {n} samples)"
 
 
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def format_eta(total, rate_info):
+    label = f"ETA (vs. unverified target of {TARGET_SOLUTIONS})"
+    if total is None:
+        return f"{label}: waiting on initial solution count..."
+    if rate_info is None:
+        return f"{label}: not enough rate history yet"
+    rate, _n, _span = rate_info
+    remaining = TARGET_SOLUTIONS - total
+    if remaining <= 0:
+        return f"{label}: target already reached"
+    if rate <= 0:
+        return f"{label}: unknown (current rate is zero)"
+    eta_seconds = remaining / rate
+    completion = datetime.now(timezone.utc) + timedelta(seconds=eta_seconds)
+    return (f"{label}: {format_duration(eta_seconds)} remaining, "
+            f"{remaining} solutions to go - est. completion "
+            f"{completion.strftime('%Y-%m-%d %H:%M UTC')}")
+
+
 def render(conn, counter, width, history_db_path):
     running = list_running_rangesolvers()
     active = fetch_active_ranges(conn)
@@ -235,6 +271,7 @@ def render(conn, counter, width, history_db_path):
         note = " (recomputing now)" if computing else ""
         lines.append(f"unique solutions found: {total}  (as of {age}){note}")
     lines.append(format_rate(rate_info))
+    lines.append(format_eta(total, rate_info))
     lines.append("-" * width)
     lines.append(f"{'ID':>5}  {'PREFIX':<16}{'STATUS':<20}{'ELAPSED':>9}  CURRENT POSITION")
     lines.append("-" * width)
