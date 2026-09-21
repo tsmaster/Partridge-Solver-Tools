@@ -28,6 +28,7 @@ import splitlog
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(SCRIPT_DIR, "ranges.db")
+DEFAULT_HISTORY_DB = os.path.join(SCRIPT_DIR, "solution_counts.db")
 DEFAULT_SOLUTION_PATTERNS = [
     os.path.join(SCRIPT_DIR, "../CppSolver/Solutions/soln_log.txt"),
     os.path.join(SCRIPT_DIR, "../Claude/Solutions/*.txt"),
@@ -109,13 +110,59 @@ def compute_total_unique_solutions(patterns):
     return len(hashes)
 
 
+def ensure_history_schema(history_db_path):
+    conn = sqlite3.connect(history_db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS solution_counts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            count INTEGER NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def record_solution_count(history_db_path, timestamp, count):
+    conn = sqlite3.connect(history_db_path, timeout=10)
+    conn.execute("INSERT INTO solution_counts (timestamp, count) VALUES (?, ?)",
+                 (timestamp, count))
+    conn.commit()
+    conn.close()
+
+
+def compute_average_rate(history_db_path):
+    """Average solutions/sec between the earliest and latest recorded samples. Returns
+    (rate, sample_count, span_seconds), or None if there isn't enough history yet."""
+    conn = sqlite3.connect(history_db_path, timeout=10)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM solution_counts").fetchone()[0]
+        if n < 2:
+            return None
+        earliest = conn.execute(
+            "SELECT timestamp, count FROM solution_counts ORDER BY timestamp ASC LIMIT 1"
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT timestamp, count FROM solution_counts ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    span = latest[0] - earliest[0]
+    if span <= 0:
+        return None
+    rate = (latest[1] - earliest[1]) / span
+    return rate, n, span
+
+
 class SolutionCounter:
     """Recomputes the true unique solution count on its own timer, in a background thread, so the
-    (much cheaper) process-list redraw never blocks on this expensive full-corpus scan."""
+    (much cheaper) process-list redraw never blocks on this expensive full-corpus scan. Each fresh
+    count also gets logged to the history database with a timestamp, for the average-rate display."""
 
-    def __init__(self, patterns, interval):
+    def __init__(self, patterns, interval, history_db_path):
         self.patterns = patterns
         self.interval = interval
+        self.history_db_path = history_db_path
         self.lock = threading.Lock()
         self.total = None
         self.last_updated = None
@@ -125,10 +172,12 @@ class SolutionCounter:
     def _run(self):
         while True:
             total = compute_total_unique_solutions(self.patterns)
+            now = time.time()
             with self.lock:
                 self.total = total
-                self.last_updated = time.time()
+                self.last_updated = now
                 self.computing = False
+            record_solution_count(self.history_db_path, now, total)
             time.sleep(self.interval)
             with self.lock:
                 self.computing = True
@@ -154,11 +203,23 @@ def format_age(sqlite_datetime_str):
     return f"{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m"
 
 
-def render(conn, counter, width):
+def format_rate(rate_info):
+    if rate_info is None:
+        return "average rate: (not enough history yet)"
+    rate, n, span = rate_info
+    if span < 3600:
+        span_str = f"{int(span // 60)}m{int(span % 60):02d}s"
+    else:
+        span_str = f"{int(span // 3600)}h{int((span % 3600) // 60):02d}m"
+    return f"average rate: {rate:.3f} solutions/sec (over {span_str}, {n} samples)"
+
+
+def render(conn, counter, width, history_db_path):
     running = list_running_rangesolvers()
     active = fetch_active_ranges(conn)
     counts, tracked = fetch_summary(conn)
     total, last_updated, computing = counter.snapshot()
+    rate_info = compute_average_rate(history_db_path)
 
     lines = []
     lines.append("Partridge Puzzle Dashboard".center(width))
@@ -173,6 +234,7 @@ def render(conn, counter, width):
         age = f"{int(time.time() - last_updated)}s ago" if last_updated else "?"
         note = " (recomputing now)" if computing else ""
         lines.append(f"unique solutions found: {total}  (as of {age}){note}")
+    lines.append(format_rate(rate_info))
     lines.append("-" * width)
     lines.append(f"{'ID':>5}  {'PREFIX':<16}{'STATUS':<20}{'ELAPSED':>9}  CURRENT POSITION")
     lines.append("-" * width)
@@ -197,6 +259,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DEFAULT_DB,
                          help=f"SQLite database to read (default: {DEFAULT_DB})")
+    parser.add_argument("--history-db", default=DEFAULT_HISTORY_DB,
+                         help="SQLite database to log (timestamp, unique-solution-count) samples "
+                              f"to, for the average-rate display (default: {DEFAULT_HISTORY_DB})")
     parser.add_argument("--solutions", action="append", default=None,
                          help="Solution log file or glob pattern to scan for the unique-solution "
                               "count; may be repeated. Default: CppSolver/Solutions/soln_log.txt "
@@ -214,7 +279,9 @@ def main():
         sys.exit(1)
 
     conn = sqlite3.connect(args.db, timeout=10)
-    counter = SolutionCounter(args.solutions or DEFAULT_SOLUTION_PATTERNS, args.scan_interval)
+    ensure_history_schema(args.history_db)
+    counter = SolutionCounter(args.solutions or DEFAULT_SOLUTION_PATTERNS, args.scan_interval,
+                               args.history_db)
 
     is_tty = sys.stdout.isatty()
     if is_tty:
@@ -222,7 +289,7 @@ def main():
     try:
         while True:
             width = shutil.get_terminal_size((100, 24)).columns
-            text = render(conn, counter, width)
+            text = render(conn, counter, width, args.history_db)
             if is_tty:
                 print("\033[H\033[J", end="")  # cursor home, clear screen
                 print(text)

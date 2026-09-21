@@ -9,7 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Runtime state for worker.py/bootstrap_ranges.py - generated, not source
+# Runtime state for worker.py/bootstrap_ranges.py/dashboard.py - generated, not source
 ranges.db
 ranges.db-wal
 ranges.db-shm
+solution_counts.db
+solution_counts.db-wal
+solution_counts.db-shm
