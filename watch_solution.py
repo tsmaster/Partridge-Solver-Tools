@@ -10,19 +10,31 @@ text.
 If the given file's rangesolver process is no longer running, waits a short grace period, then
 automatically switches to whichever currently-running rangesolver process has the most recently
 created log file - so the tool keeps following live work instead of sitting on a finished range.
+
+Multiple independent copies of this script (one per xterm window) coordinate through a small
+shared database (watchers.db) recording which log file each is currently following, so an
+auto-switch prefers a job nobody else is already watching - avoiding several windows collapsing
+onto the same job when their previous ones happen to finish around the same time. Press space at
+any time to manually cycle forward to the next available job, same preference applied.
 """
 import argparse
 import os
 import re
+import select
+import signal
+import sqlite3
 import subprocess
 import sys
+import termios
 import time
+import tty
 
 import solution
 import solution_db
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOLUTIONS_DIR = os.path.join(SCRIPT_DIR, "../Claude/Solutions")
+DEFAULT_WATCHERS_DB = os.path.join(SCRIPT_DIR, "watchers.db")
 
 POLL_INTERVAL = 1.0
 GRACE_PERIOD = 5.0  # seconds to wait after a process disappears before switching files
@@ -76,14 +88,117 @@ def list_running_rangesolvers():
     return result
 
 
-def pick_most_recently_started(running):
-    """Given {log_basename: (pid, etimes)}, returns (path, basename, pid) for whichever process
-    has been running the shortest time - i.e. started most recently - or None if nothing's
-    currently running."""
+def pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def ensure_watchers_schema(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchers (
+            watcher_pid INTEGER PRIMARY KEY,
+            log_file TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def claim_watcher(db_path, watcher_pid, log_file):
+    conn = sqlite3.connect(db_path, timeout=5)
+    conn.execute(
+        "INSERT INTO watchers (watcher_pid, log_file, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(watcher_pid) DO UPDATE SET "
+        "log_file=excluded.log_file, updated_at=excluded.updated_at",
+        (watcher_pid, log_file, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def release_watcher(db_path, watcher_pid):
+    conn = sqlite3.connect(db_path, timeout=5)
+    conn.execute("DELETE FROM watchers WHERE watcher_pid=?", (watcher_pid,))
+    conn.commit()
+    conn.close()
+
+
+def other_claimed_files(db_path, own_pid):
+    """Returns the set of log-file basenames currently claimed by other watch_solution.py
+    processes that are actually still alive, opportunistically cleaning up any stale claims left
+    behind by one that wasn't (e.g. killed without a chance to release its own claim)."""
+    conn = sqlite3.connect(db_path, timeout=5)
+    rows = conn.execute(
+        "SELECT watcher_pid, log_file FROM watchers WHERE watcher_pid != ?", (own_pid,)
+    ).fetchall()
+    conn.close()
+    claimed = set()
+    stale_pids = []
+    for watcher_pid, log_file in rows:
+        if pid_alive(watcher_pid):
+            claimed.add(log_file)
+        else:
+            stale_pids.append(watcher_pid)
+    if stale_pids:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.executemany("DELETE FROM watchers WHERE watcher_pid=?",
+                          [(p,) for p in stale_pids])
+        conn.commit()
+        conn.close()
+    return claimed
+
+
+def most_recently_started(pool):
+    """pool: {log_basename: (pid, etimes)}. Returns (path, basename, pid) for whichever has been
+    running the shortest time - i.e. started most recently - or None if pool is empty."""
+    if not pool:
+        return None
+    basename, (pid, _etimes) = min(pool.items(), key=lambda kv: kv[1][1])
+    return os.path.join(SOLUTIONS_DIR, basename), basename, pid
+
+
+def pick_unclaimed_or_most_recent(running, watchers_db, own_pid):
+    """Prefers whichever currently-running job no other live watcher is already following (most
+    recently started among those); falls back to the overall most-recently-started job if every
+    running one is already claimed (unavoidable once there are more watchers than active jobs)."""
+    claimed = other_claimed_files(watchers_db, own_pid)
+    unclaimed_pool = {b: v for b, v in running.items() if b not in claimed}
+    return most_recently_started(unclaimed_pool or running)
+
+
+def cycle_forward(running, watchers_db, own_pid, current_basename):
+    """Returns the next candidate after `current_basename` in a stable sorted order, preferring
+    ones no other live watcher is already following, and wrapping around at the end. None if
+    nothing is currently running at all."""
     if not running:
         return None
-    basename, (pid, _etimes) = min(running.items(), key=lambda kv: kv[1][1])
+    claimed = other_claimed_files(watchers_db, own_pid)
+    unclaimed = sorted(b for b in running if b not in claimed)
+    pool = unclaimed or sorted(running.keys())
+    next_index = (pool.index(current_basename) + 1) % len(pool) if current_basename in pool else 0
+    basename = pool[next_index]
+    pid, _etimes = running[basename]
     return os.path.join(SOLUTIONS_DIR, basename), basename, pid
+
+
+def wait_for_key(timeout, stdin_is_tty):
+    """Waits up to `timeout` seconds for a single keypress on stdin (assumed already in cbreak
+    mode), returning it, or None if nothing was pressed. Falls back to a plain sleep when stdin
+    isn't a real terminal (e.g. redirected), since reading from it wouldn't mean what it should."""
+    if not stdin_is_tty:
+        time.sleep(timeout)
+        return None
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if ready:
+        return sys.stdin.read(1)
+    return None
 
 
 # How much darker a tile's outer ring of cells is than its own interior fill - purely a matter
@@ -167,10 +282,13 @@ def render_grid(buf):
     return "\n".join(lines), soln.get_hash()
 
 
+FOOTER = "Space to switch, Ctrl-C to exit"
+
+
 def draw(is_tty, basename, pid, buf):
     grid_text, hash_str = render_grid(buf)
     status = f"pid {pid}" if pid is not None else "process finished"
-    text = f"Watching: {basename} ({status})\nHash: {hash_str}\n\n{grid_text}\n\nCtrl-C to exit"
+    text = f"Watching: {basename} ({status})\nHash: {hash_str}\n\n{grid_text}\n\n{FOOTER}"
     if is_tty:
         print("\033[H\033[J", end="")
     print(text)
@@ -180,35 +298,62 @@ def draw(is_tty, basename, pid, buf):
 def draw_message(is_tty, message):
     if is_tty:
         print("\033[H\033[J", end="")
-    print(message)
+    print(f"{message}\n\n{FOOTER}")
     sys.stdout.flush()
 
 
-def watch(initial_path, refresh):
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def watch(initial_path, refresh, watchers_db):
     is_tty = sys.stdout.isatty()
+    stdin_is_tty = sys.stdin.isatty()
+    own_pid = os.getpid()
+
+    # Python only converts SIGINT (Ctrl-C) to KeyboardInterrupt by default; SIGTERM (e.g. from
+    # `kill` or `timeout`) and SIGHUP (a closed terminal window) would otherwise terminate the
+    # process immediately, skipping the finally block below and leaving a stale claim in
+    # watchers.db until another watcher's staleness check eventually notices the dead pid.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_keyboard_interrupt)
+
     if is_tty:
-        print("\033[?25l", end="")
+        print("\033[?25l", end="")  # hide cursor
+    old_termios = None
+    if stdin_is_tty:
+        old_termios = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())  # deliver each keypress immediately, no Enter needed
+
+    ensure_watchers_schema(watchers_db)
 
     path = initial_path
     basename = os.path.basename(path) if path else None
     bytes_ingested = 0
     last_buf = None
     grace_deadline = None
+    if basename:
+        claim_watcher(watchers_db, own_pid, basename)
+
+    def switch_to(choice):
+        nonlocal path, basename, bytes_ingested, last_buf, grace_deadline
+        path, basename, _pid = choice
+        bytes_ingested = 0
+        last_buf = None
+        grace_deadline = None
+        claim_watcher(watchers_db, own_pid, basename)
 
     try:
         while True:
             running = list_running_rangesolvers()
 
             if path is None:
-                choice = pick_most_recently_started(running)
+                choice = pick_unclaimed_or_most_recent(running, watchers_db, own_pid)
                 if choice is None:
                     draw_message(is_tty, "Waiting for an active rangesolver process...")
-                    time.sleep(refresh)
+                    wait_for_key(refresh, stdin_is_tty)
                     continue
-                path, basename, _pid = choice
-                bytes_ingested = 0
-                last_buf = None
-                grace_deadline = None
+                switch_to(choice)
 
             pid, _etimes = running.get(basename, (None, None))
 
@@ -231,12 +376,20 @@ def watch(initial_path, refresh):
             else:
                 grace_deadline = None
 
-            time.sleep(refresh)
+            key = wait_for_key(refresh, stdin_is_tty)
+            if key == " ":
+                choice = cycle_forward(list_running_rangesolvers(), watchers_db, own_pid,
+                                        basename)
+                if choice is not None:
+                    switch_to(choice)
     except KeyboardInterrupt:
         pass
     finally:
+        release_watcher(watchers_db, own_pid)
+        if stdin_is_tty and old_termios is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
         if is_tty:
-            print("\033[?25h")
+            print("\033[?25h")  # restore cursor
 
 
 def main():
@@ -248,10 +401,13 @@ def main():
                               "log file was most recently created.")
     parser.add_argument("--refresh", type=float, default=POLL_INTERVAL,
                          help=f"Seconds between polls (default: {POLL_INTERVAL})")
+    parser.add_argument("--watchers-db", default=DEFAULT_WATCHERS_DB,
+                         help="SQLite database this instance and others coordinate through, to "
+                              f"avoid picking the same job (default: {DEFAULT_WATCHERS_DB})")
     args = parser.parse_args()
 
     initial_path = resolve_path(args.logfile) if args.logfile else None
-    watch(initial_path, args.refresh)
+    watch(initial_path, args.refresh, args.watchers_db)
 
 
 if __name__ == "__main__":

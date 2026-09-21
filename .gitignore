@@ -19,3 +19,6 @@ solution_counts.db-shm
 solutions.db
 solutions.db-wal
 solutions.db-shm
+watchers.db
+watchers.db-wal
+watchers.db-shm
