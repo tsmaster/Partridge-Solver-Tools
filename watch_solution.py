@@ -110,13 +110,51 @@ def build_color_grid(soln):
     return grid
 
 
+# Tiles smaller than this have no sensible interior to put a readable digit in (a 2x2 or 3x3
+# tile is entirely its own "border" ring already - see build_color_grid's on_edge check).
+DIGIT_MIN_SIZE = 4
+
+
+def brightness(color):
+    r, g, b = color
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def text_color_for(background):
+    return (0, 0, 0) if brightness(background) > 140 else (255, 255, 255)
+
+
+def build_digit_positions(soln):
+    """Returns {(row_pair_start_y, x): (digit_char, text_color, tile_fill_color)} for each tile
+    big enough to sensibly show its own size as a single character near its center. The text
+    color is chosen for contrast against that tile's own fill color, not a fixed black or white,
+    so it stays readable across the whole (fairly varied) palette."""
+    positions = {}
+    for loc in soln.piece_locations:
+        if loc.sz < DIGIT_MIN_SIZE:
+            continue
+        center_x = loc.x + loc.sz // 2
+        center_y = loc.y + loc.sz // 2
+        y_pair = center_y - (center_y % 2)
+        fill = COLORS[loc.sz]
+        positions[(y_pair, center_x)] = (str(loc.sz), text_color_for(fill), fill)
+    return positions
+
+
 def render_grid(buf):
     soln = solution.make_solution_from_lines(buf)
     grid = build_color_grid(soln)
+    digit_positions = build_digit_positions(soln)
     lines = []
     for y in range(0, 45, 2):
         chars = []
         for x in range(45):
+            digit_info = digit_positions.get((y, x))
+            if digit_info is not None:
+                digit, fg, bg = digit_info
+                chars.append(f"\033[1m\033[38;2;{fg[0]};{fg[1]};{fg[2]}m"
+                             f"\033[48;2;{bg[0]};{bg[1]};{bg[2]}m{digit}\033[22m")
+                continue
             top = grid[y][x]
             if y + 1 < 45:
                 bottom = grid[y + 1][x]
