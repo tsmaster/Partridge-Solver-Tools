@@ -25,7 +25,7 @@ DEFAULT_DB = os.path.join(SCRIPT_DIR, "ranges.db")
 CLAUDE_DIR = os.path.join(SCRIPT_DIR, "..", "Claude")
 RANGESOLVER = os.path.join(CLAUDE_DIR, "rangesolver")
 
-PATH_RE = re.compile(r"path=(\d+)\s*$")
+PROGRESS_RE = re.compile(r"\[t=([\d.]+)s\] depth=\s*(\d+) solutions=(\d+) path=(\d+)\s*$")
 DONE_RE = re.compile(r"Done\. (\d+) solution")
 
 _current_child = None
@@ -111,9 +111,14 @@ def update_progress(conn, range_id, path):
     conn.commit()
 
 
-def run_range(conn, work):
+def run_range(conn, work, use_inplace):
     """Runs one claimed range to completion (or interruption). Returns False if the caller
-    should stop entirely (fatal launch failure, or a shutdown was requested), True to keep going."""
+    should stop entirely (fatal launch failure, or a shutdown was requested), True to keep going.
+
+    rangesolver itself is always run with --status=scroll, regardless of use_inplace: its inplace
+    mode uses \\r plus ANSI escapes rather than newlines between updates, which would break the
+    line-by-line stdout parsing below. Instead, when use_inplace is set, this function renders its
+    own overwriting status line from the progress it already parses - same UX, no parsing risk."""
     global _current_child
     range_id = work["id"]
     log_name = f"soln_{work['prefix']}_{range_id}.txt"
@@ -141,18 +146,34 @@ def run_range(conn, work):
     _current_child = proc
     last_path = None
     solutions_found = None
+    status_line_open = False
     for line in proc.stdout:
         line = line.rstrip()
-        print(f"[{work['prefix']}] {line}", flush=True)
-        m = PATH_RE.search(line)
+        m = PROGRESS_RE.search(line)
         if m:
-            last_path = m.group(1)
-            update_progress(conn, range_id, last_path)
+            elapsed, depth, solutions, path = m.groups()
+            last_path = path
+            update_progress(conn, range_id, path)
+            status = (f"[worker {os.getpid()}] range {range_id} (prefix {work['prefix']}) "
+                      f"t={elapsed}s depth={depth} solutions={solutions} path={path}")
+            if use_inplace:
+                print(f"\r\033[K{status}", end="", flush=True)
+                status_line_open = True
+            else:
+                print(status, flush=True)
             continue
+
+        if status_line_open:
+            print()  # move off the in-place status line before printing a normal line
+            status_line_open = False
+        print(f"[{work['prefix']}] {line}", flush=True)
+
         m = DONE_RE.search(line)
         if m:
             solutions_found = int(m.group(1))
 
+    if status_line_open:
+        print()
     proc.wait()
     _current_child = None
 
@@ -176,12 +197,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DEFAULT_DB,
                          help=f"SQLite database to claim ranges from (default: {DEFAULT_DB})")
+    parser.add_argument("--status", choices=["inplace", "scroll"], default=None,
+                         help="How this worker prints its own progress line: 'inplace' overwrites "
+                              "it in place, 'scroll' prints one line per update. Default: inplace "
+                              "when stdout is a terminal, scroll otherwise (mirrors rangesolver's "
+                              "own --status, though rangesolver itself is always run in scroll "
+                              "mode internally so this script can parse its output).")
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
         print(f"Error: database '{args.db}' does not exist - run bootstrap_ranges.py first.",
               file=sys.stderr)
         sys.exit(1)
+
+    use_inplace = (args.status == "inplace") if args.status else sys.stdout.isatty()
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, handle_signal)
@@ -197,7 +226,7 @@ def main():
         if _shutdown_requested:
             release_range(conn, work["id"])
             break
-        if not run_range(conn, work):
+        if not run_range(conn, work, use_inplace):
             break
 
     conn.close()
