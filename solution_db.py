@@ -60,10 +60,12 @@ def resolve_solution_files(patterns):
 
 def scan_new_blocks(filename, prior_bytes):
     """Reads whatever has been appended to `filename` since `prior_bytes`, returning
-    (hashes, new_bytes_ingested). Only counts complete 45-line blocks - a block still mid-write,
-    or even just a trailing partial line, is left alone for the next scan rather than guessed at.
-    Safe by construction: rangesolver only fflushes a block once its full 45 lines plus the "---"
-    delimiter are written, so a reader never observes a genuinely half-written block."""
+    (buffers, new_bytes_ingested) - each buffer is the raw list of 45 lines making up one
+    complete solution block, in the order they appear in the file. Only counts complete 45-line
+    blocks - a block still mid-write, or even just a trailing partial line, is left alone for the
+    next scan rather than guessed at. Safe by construction: rangesolver only fflushes a block
+    once its full 45 lines plus the "---" delimiter are written, so a reader never observes a
+    genuinely half-written block."""
     try:
         size = os.path.getsize(filename)
     except OSError:
@@ -81,20 +83,19 @@ def scan_new_blocks(filename, prior_bytes):
     if lines and not lines[-1].endswith("\n"):
         lines = lines[:-1]  # a line still being written - not safe to parse yet
 
-    hashes = []
+    buffers = []
     consumed_lines = 0
     i, n = 0, len(lines)
     while i < n:
         if splitlog.buffer_starts_at_line(i, lines):
-            buf = lines[i:i + 45]
-            hashes.append(solution.make_solution_from_lines(buf).get_hash())
+            buffers.append(lines[i:i + 45])
             i += 45
             consumed_lines = i
         else:
             i += 1
 
     new_bytes = sum(len(l) for l in lines[:consumed_lines])
-    return hashes, prior_bytes + new_bytes
+    return buffers, prior_bytes + new_bytes
 
 
 def ingest_all(db_path, patterns):
@@ -108,8 +109,9 @@ def ingest_all(db_path, patterns):
             "SELECT bytes_ingested FROM ingested_files WHERE filename=?", (abspath,)
         ).fetchone()
         prior_bytes = row[0] if row else 0
-        hashes, new_bytes = scan_new_blocks(filename, prior_bytes)
-        for h in hashes:
+        buffers, new_bytes = scan_new_blocks(filename, prior_bytes)
+        for buf in buffers:
+            h = solution.make_solution_from_lines(buf).get_hash()
             conn.execute(
                 "INSERT OR IGNORE INTO solutions (hash, source_file, ingested_at) "
                 "VALUES (?, ?, ?)",
