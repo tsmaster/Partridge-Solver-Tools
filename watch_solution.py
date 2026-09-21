@@ -291,29 +291,23 @@ def render_grid(buf):
     return "\n".join(lines), soln.get_hash()
 
 
-def footer(last_key):
-    # TEMPORARY diagnostic while tracking down a report that space-to-cycle isn't working -
-    # shows exactly what the last keypress read looked like, to tell apart "nothing was read"
-    # from "something was read, but not what we expected." Remove once that's resolved.
-    key_info = f"none yet" if last_key is None else repr(last_key)
-    return f"Space to switch, Ctrl-C to exit   [last key read: {key_info}]"
+FOOTER = "Space to switch, Ctrl-C to exit"
 
 
-def draw(is_tty, basename, pid, buf, last_key):
+def draw(is_tty, basename, pid, buf):
     grid_text, hash_str = render_grid(buf)
     status = f"pid {pid}" if pid is not None else "process finished"
-    text = (f"Watching: {basename} ({status})\nHash: {hash_str}\n\n{grid_text}\n\n"
-            f"{footer(last_key)}")
+    text = f"Watching: {basename} ({status})\nHash: {hash_str}\n\n{grid_text}\n\n{FOOTER}"
     if is_tty:
         print("\033[H\033[J", end="")
     print(text)
     sys.stdout.flush()
 
 
-def draw_message(is_tty, message, last_key):
+def draw_message(is_tty, message):
     if is_tty:
         print("\033[H\033[J", end="")
-    print(f"{message}\n\n{footer(last_key)}")
+    print(f"{message}\n\n{FOOTER}")
     sys.stdout.flush()
 
 
@@ -347,7 +341,6 @@ def watch(initial_path, refresh, watchers_db):
     bytes_ingested = 0
     last_buf = None
     grace_deadline = None
-    last_key = None
     if basename:
         claim_watcher(watchers_db, own_pid, basename)
 
@@ -366,10 +359,8 @@ def watch(initial_path, refresh, watchers_db):
             if path is None:
                 choice = pick_unclaimed_or_most_recent(running, watchers_db, own_pid)
                 if choice is None:
-                    draw_message(is_tty, "Waiting for an active rangesolver process...", last_key)
-                    key = wait_for_key(refresh, stdin_is_tty)
-                    if key:
-                        last_key = key
+                    draw_message(is_tty, "Waiting for an active rangesolver process...")
+                    wait_for_key(refresh, stdin_is_tty)
                     continue
                 switch_to(choice)
 
@@ -380,11 +371,11 @@ def watch(initial_path, refresh, watchers_db):
                 last_buf = new_buffers[-1]
 
             if last_buf is not None:
-                draw(is_tty, basename, pid, last_buf, last_key)
+                draw(is_tty, basename, pid, last_buf)
             else:
                 status = f"pid {pid}" if pid is not None else "process finished"
                 draw_message(is_tty, f"Watching: {basename} ({status})\n"
-                                      "Waiting for the first solution in this range...", last_key)
+                                      "Waiting for the first solution in this range...")
 
             if pid is None:
                 if grace_deadline is None:
@@ -395,8 +386,6 @@ def watch(initial_path, refresh, watchers_db):
                 grace_deadline = None
 
             key = wait_for_key(refresh, stdin_is_tty)
-            if key:
-                last_key = key
             if key == " ":
                 choice = cycle_forward(list_running_rangesolvers(), watchers_db, own_pid,
                                         basename)
