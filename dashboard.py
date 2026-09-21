@@ -6,13 +6,14 @@ running rangesolver processes (matched via each process's --log= argument, not t
 pid, since that's worker.py's own pid, not its rangesolver child's) - so a range whose worker died
 without releasing it shows up clearly as ORPHANED rather than silently looking active.
 
-Also periodically recomputes the true deduplicated solution count across the whole corpus. That
-scan reads every solution file from scratch (same approach as bootstrap_ranges.py) and gets more
-expensive as more per-range log files accumulate, so it runs on its own timer in a background
-thread rather than blocking the fast (process list) redraw loop.
+Also periodically kicks off solution_db.py's incremental ingest (new solutions from the ASCII
+logs into solutions.db) and reads the resulting total back. That keeps the per-cycle cost down to
+whatever's newly appended since the last check, rather than re-parsing the whole corpus from
+scratch every time - but ingestion itself still runs in a background thread, since even the
+incremental case can take a moment right after startup (first run for a file) or after a burst of
+new solutions, and the process-list redraw shouldn't wait on it.
 """
 import argparse
-import glob
 import os
 import re
 import shutil
@@ -23,16 +24,13 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-import solution
-import splitlog
+import solution_db
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(SCRIPT_DIR, "ranges.db")
 DEFAULT_HISTORY_DB = os.path.join(SCRIPT_DIR, "solution_counts.db")
-DEFAULT_SOLUTION_PATTERNS = [
-    os.path.join(SCRIPT_DIR, "../CppSolver/Solutions/soln_log.txt"),
-    os.path.join(SCRIPT_DIR, "../Claude/Solutions/*.txt"),
-]
+DEFAULT_SOLUTIONS_DB = solution_db.DEFAULT_SOLUTIONS_DB
+DEFAULT_SOLUTION_PATTERNS = solution_db.DEFAULT_SOLUTION_PATTERNS
 REFRESH_INTERVAL = 2.0
 SOLUTION_SCAN_INTERVAL = 60.0
 
@@ -94,27 +92,6 @@ def fetch_summary(conn):
     return counts, tracked
 
 
-def resolve_solution_files(patterns):
-    files = []
-    for pattern in patterns:
-        matched = glob.glob(pattern)
-        files.extend(matched if matched else [pattern])
-    return files
-
-
-def compute_total_unique_solutions(patterns):
-    hashes = set()
-    for fn in resolve_solution_files(patterns):
-        try:
-            with open(fn) as f:
-                lines = f.readlines()
-        except OSError:
-            continue
-        for buf in splitlog.get_raw_buffers(lines):
-            hashes.add(solution.make_solution_from_lines(buf).get_hash())
-    return len(hashes)
-
-
 def ensure_history_schema(history_db_path):
     conn = sqlite3.connect(history_db_path)
     conn.execute("""
@@ -160,23 +137,25 @@ def compute_average_rate(history_db_path):
 
 
 class SolutionCounter:
-    """Recomputes the true unique solution count on its own timer, in a background thread, so the
-    (much cheaper) process-list redraw never blocks on this expensive full-corpus scan. Each fresh
-    count also gets logged to the history database with a timestamp, for the average-rate display."""
+    """Kicks off solution_db's incremental ingest on its own timer, in a background thread, so the
+    (much cheaper) process-list redraw never blocks on it. Each fresh total also gets logged to
+    the history database with a timestamp, for the average-rate display."""
 
-    def __init__(self, patterns, interval, history_db_path):
+    def __init__(self, patterns, interval, solutions_db_path, history_db_path):
         self.patterns = patterns
         self.interval = interval
+        self.solutions_db_path = solutions_db_path
         self.history_db_path = history_db_path
         self.lock = threading.Lock()
         self.total = None
         self.last_updated = None
         self.computing = True
+        solution_db.ensure_schema(solutions_db_path)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
-            total = compute_total_unique_solutions(self.patterns)
+            total = solution_db.ingest_all(self.solutions_db_path, self.patterns)
             now = time.time()
             with self.lock:
                 self.total = total
@@ -299,14 +278,17 @@ def main():
     parser.add_argument("--history-db", default=DEFAULT_HISTORY_DB,
                          help="SQLite database to log (timestamp, unique-solution-count) samples "
                               f"to, for the average-rate display (default: {DEFAULT_HISTORY_DB})")
+    parser.add_argument("--solutions-db", default=DEFAULT_SOLUTIONS_DB,
+                         help="SQLite database that solution_db.py ingests solutions into "
+                              f"(default: {DEFAULT_SOLUTIONS_DB})")
     parser.add_argument("--solutions", action="append", default=None,
-                         help="Solution log file or glob pattern to scan for the unique-solution "
-                              "count; may be repeated. Default: CppSolver/Solutions/soln_log.txt "
-                              "and Claude/Solutions/*.txt")
+                         help="Solution log file or glob pattern to ingest; may be repeated. "
+                              "Default: CppSolver/Solutions/soln_log.txt and "
+                              "Claude/Solutions/*.txt")
     parser.add_argument("--refresh", type=float, default=REFRESH_INTERVAL,
                          help=f"Seconds between process-list redraws (default: {REFRESH_INTERVAL})")
     parser.add_argument("--scan-interval", type=float, default=SOLUTION_SCAN_INTERVAL,
-                         help="Seconds between full-corpus unique-solution rescans "
+                         help="Seconds between solution_db ingest passes "
                               f"(default: {SOLUTION_SCAN_INTERVAL})")
     args = parser.parse_args()
 
@@ -318,7 +300,7 @@ def main():
     conn = sqlite3.connect(args.db, timeout=10)
     ensure_history_schema(args.history_db)
     counter = SolutionCounter(args.solutions or DEFAULT_SOLUTION_PATTERNS, args.scan_interval,
-                               args.history_db)
+                               args.solutions_db, args.history_db)
 
     is_tty = sys.stdout.isatty()
     if is_tty:

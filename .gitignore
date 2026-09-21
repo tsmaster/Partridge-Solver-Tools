@@ -16,3 +16,6 @@ ranges.db-shm
 solution_counts.db
 solution_counts.db-wal
 solution_counts.db-shm
+solutions.db
+solutions.db-wal
+solutions.db-shm
