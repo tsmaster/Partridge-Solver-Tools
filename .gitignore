@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime state for worker.py/bootstrap_ranges.py - generated, not source
+ranges.db
+ranges.db-wal
+ranges.db-shm
