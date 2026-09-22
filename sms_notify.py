@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Texts the current unique-solution count (and progress since the last run) via Twilio.
+"""Texts the current unique-solution count (and progress since the last run) via TextBelt.
 
 Meant to be run periodically (e.g. via cron, ~4x/day) as a status check-in, independent of
 whether the dashboard happens to be running. Reuses solution_db.py for an up-to-date count (fast:
@@ -7,20 +7,19 @@ only newly-appended log content gets read, not the whole corpus) and dashboard.p
 solution_counts.db history table for the "X new since last check" delta and rate/ETA - the same
 shared state the dashboard itself reads, kept in sync regardless of which one last wrote to it.
 
-Setup: sign up for Twilio (a small free trial credit is enough to test this), get a phone number
-from it, and create a file called .env right next to this script (never commit it - it's already
-in .gitignore) with four lines:
-    TWILIO_ACCOUNT_SID=...
-    TWILIO_AUTH_TOKEN=...
-    TWILIO_FROM_NUMBER=+15551234567
-    TWILIO_TO_NUMBER=+15559876543
+Setup: get a key from textbelt.com (no business verification - either buy a small quota, a few
+cents per text, or use the literal key "textbelt" for a shared free tier limited to 1 text/day,
+fine for a first test but too limited for real ~4x/day use), and create a file called .env right
+next to this script (never commit it - it's already in .gitignore) with two lines:
+    TEXTBELT_API_KEY=your_key_or_textbelt
+    TEXTBELT_TO_NUMBER=+15559876543
 A .env file (loaded via python-dotenv) is used instead of just `export`ing these in your shell
 because cron jobs start with a minimal environment that doesn't inherit your interactive shell's
 exported variables at all - a file loaded by the script itself works the same way regardless of
 what invokes it. Setting real environment variables still works too and takes precedence.
 """
 import argparse
-import base64
+import json
 import os
 import sqlite3
 import sys
@@ -37,8 +36,7 @@ import solution_db
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
-REQUIRED_ENV_VARS = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
-                     "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER"]
+REQUIRED_ENV_VARS = ["TEXTBELT_API_KEY", "TEXTBELT_TO_NUMBER"]
 
 
 def most_recent_sample(history_db_path):
@@ -68,17 +66,19 @@ def compose_message(total, previous):
     return " ".join(lines)
 
 
-def send_sms(account_sid, auth_token, from_number, to_number, body):
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
-    data = urllib.parse.urlencode({"To": to_number, "From": from_number, "Body": body}).encode()
-    credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
-    req = urllib.request.Request(url, data=data)
-    req.add_header("Authorization", f"Basic {credentials}")
+def send_sms(api_key, to_number, message):
+    data = urllib.parse.urlencode(
+        {"phone": to_number, "message": message, "key": api_key}
+    ).encode()
+    req = urllib.request.Request("https://textbelt.com/text", data=data)
     try:
         with urllib.request.urlopen(req) as resp:
-            return resp.status, resp.read().decode()
+            body = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Twilio returned HTTP {e.code}: {e.read().decode()}") from e
+        raise RuntimeError(f"TextBelt returned HTTP {e.code}: {e.read().decode()}") from e
+    if not body.get("success"):
+        raise RuntimeError(f"TextBelt error: {body.get('error', 'unknown error')}")
+    return body
 
 
 def main():
@@ -118,11 +118,11 @@ def main():
     if args.dry_run:
         print("(--dry-run: not actually sending)")
     else:
-        status, _body = send_sms(
-            os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"],
-            os.environ["TWILIO_FROM_NUMBER"], os.environ["TWILIO_TO_NUMBER"], message,
-        )
-        print(f"Sent (Twilio HTTP {status}).")
+        result = send_sms(os.environ["TEXTBELT_API_KEY"], os.environ["TEXTBELT_TO_NUMBER"],
+                           message)
+        quota = result.get("quotaRemaining")
+        print(f"Sent (TextBelt textId={result.get('textId')}"
+              f"{f', quota remaining={quota}' if quota is not None else ''}).")
 
     dashboard.record_solution_count(args.history_db, time.time(), total)
 
