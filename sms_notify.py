@@ -8,12 +8,16 @@ solution_counts.db history table for the "X new since last check" delta and rate
 shared state the dashboard itself reads, kept in sync regardless of which one last wrote to it.
 
 Setup: sign up for Twilio (a small free trial credit is enough to test this), get a phone number
-from it, and set four environment variables before running - never commit these or paste them
-into a chat:
-    TWILIO_ACCOUNT_SID   - from the Twilio console
-    TWILIO_AUTH_TOKEN    - from the Twilio console
-    TWILIO_FROM_NUMBER   - the Twilio number you were assigned, e.g. +15551234567
-    TWILIO_TO_NUMBER     - the phone number to text, e.g. your own, +15559876543
+from it, and create a file called .env right next to this script (never commit it - it's already
+in .gitignore) with four lines:
+    TWILIO_ACCOUNT_SID=...
+    TWILIO_AUTH_TOKEN=...
+    TWILIO_FROM_NUMBER=+15551234567
+    TWILIO_TO_NUMBER=+15559876543
+A .env file (loaded via python-dotenv) is used instead of just `export`ing these in your shell
+because cron jobs start with a minimal environment that doesn't inherit your interactive shell's
+exported variables at all - a file loaded by the script itself works the same way regardless of
+what invokes it. Setting real environment variables still works too and takes precedence.
 """
 import argparse
 import base64
@@ -25,8 +29,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from dotenv import load_dotenv
+
 import dashboard
 import solution_db
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 REQUIRED_ENV_VARS = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
                      "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER"]

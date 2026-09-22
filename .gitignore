@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Secrets - never commit (sms_notify.py's Twilio credentials)
+.env
+
 # Runtime state for worker.py/bootstrap_ranges.py/dashboard.py - generated, not source
 ranges.db
 ranges.db-wal
