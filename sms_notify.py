@@ -50,19 +50,29 @@ def most_recent_sample(history_db_path):
     return row
 
 
-def compose_message(total, previous):
+def compose_message(total, previous, rate_info):
+    """`previous` (a recent (timestamp, count) sample - possibly just dashboard.py's own last
+    background write, seconds old, not necessarily this script's own last run) gives the
+    "+X since last check" line. `rate_info` - dashboard.py's compute_average_rate(), averaged
+    over the *entire* history table - drives the ETA instead, since a short window (a minute, or
+    even the 3h between cron runs) is too noisy: solution discovery is bursty enough that it can
+    be off by several x from the true rate."""
     lines = [f"Partridge puzzle: {total:,} unique solutions found."]
     if previous is not None:
         prev_ts, prev_count = previous
         delta = total - prev_count
         elapsed = time.time() - prev_ts
         lines.append(f"+{delta:,} since last check ({dashboard.format_duration(elapsed)} ago).")
-        if elapsed > 0 and delta > 0:
-            rate = delta / elapsed
-            remaining = dashboard.TARGET_SOLUTIONS - total
-            if remaining > 0:
-                eta = dashboard.format_duration(remaining / rate)
-                lines.append(f"~{eta} to unverified target of {dashboard.TARGET_SOLUTIONS:,}.")
+    if rate_info is not None:
+        rate, _n, _span = rate_info
+        remaining = dashboard.TARGET_SOLUTIONS - total
+        if rate > 0 and remaining > 0:
+            eta = dashboard.format_duration(remaining / rate)
+            # Not "X.XX/s" - a bare decimal-slash-letters shape reads as a URL to TextBelt's
+            # link filter (unverified keys can't send anything link-shaped) and got every message
+            # with that suffix silently rejected server-side (confirmed via cron_sms.log).
+            lines.append(f"~{eta} to unverified target of {dashboard.TARGET_SOLUTIONS:,} "
+                         f"(averaging {rate:.2f} solutions per sec).")
     return " ".join(lines)
 
 
@@ -112,7 +122,8 @@ def main():
         print(f"No change since last check ({total:,} solutions) - not sending.")
         return
 
-    message = compose_message(total, previous)
+    rate_info = dashboard.compute_average_rate(args.history_db)
+    message = compose_message(total, previous, rate_info)
     print(message)
 
     if args.dry_run:

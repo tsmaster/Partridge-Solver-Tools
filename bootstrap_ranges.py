@@ -104,7 +104,8 @@ def create_schema(conn):
             claimed_at TEXT,
             finished_at TEXT,
             solutions_found INTEGER,
-            log_file TEXT
+            log_file TEXT,
+            priority INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ranges_status ON ranges(status);")

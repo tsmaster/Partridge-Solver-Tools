@@ -86,10 +86,43 @@ def fetch_active_ranges(conn):
 
 def fetch_summary(conn):
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM ranges GROUP BY status").fetchall())
+    # 'historical' rows are pre-system bookkeeping (e.g. job #1's pre-bootstrap contribution,
+    # recorded once solution_found is known but not a range this system ever searched itself) -
+    # counted here alongside done/split, but deliberately excluded from
+    # compute_range_completion_rate() and fetch_range_remaining(), which only care about ranges
+    # this system actually claims and searches.
     tracked = conn.execute(
-        "SELECT COALESCE(SUM(solutions_found), 0) FROM ranges WHERE status='done'"
+        "SELECT COALESCE(SUM(solutions_found), 0) FROM ranges "
+        "WHERE status IN ('done', 'split', 'historical')"
     ).fetchone()[0]
     return counts, tracked
+
+
+def compute_range_completion_rate(conn):
+    """Average done-or-split ranges/sec across the whole run so far. Unlike the solution-count
+    rate, this needs no separate history table - every finished range already records its own
+    finished_at in ranges.db, so the earliest-to-latest span is computed directly from that.
+    Returns (rate, n, span_seconds), or None if there isn't enough history yet."""
+    row = conn.execute(
+        "SELECT COUNT(*), MIN(finished_at), MAX(finished_at) FROM ranges "
+        "WHERE status IN ('done', 'split')"
+    ).fetchone()
+    n, earliest, latest = row
+    if n is None or n < 2 or earliest is None or latest is None or latest == earliest:
+        return None
+    span = conn.execute(
+        "SELECT (julianday(?) - julianday(?)) * 86400.0", (latest, earliest)
+    ).fetchone()[0]
+    if span is None or span <= 0:
+        return None
+    return n / span, n, span
+
+
+def fetch_range_remaining(conn):
+    return conn.execute(
+        "SELECT COUNT(*) FROM ranges WHERE status IN ('unsearched', 'in_progress', "
+        "'held_for_split')"
+    ).fetchone()[0]
 
 
 def ensure_history_schema(history_db_path):
@@ -150,16 +183,32 @@ class SolutionCounter:
         self.total = None
         self.last_updated = None
         self.computing = True
+        self.last_error = None
         solution_db.ensure_schema(solutions_db_path)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
-            total = solution_db.ingest_all(self.solutions_db_path, self.patterns)
+            try:
+                total = solution_db.ingest_all(self.solutions_db_path, self.patterns)
+            except Exception as e:
+                # Never let a bad log chunk (or any other transient failure) silently kill this
+                # daemon thread - that would freeze the displayed total/rate/ETA forever with no
+                # visible sign anything was wrong. Log it, keep the last-good total on display via
+                # last_error, and retry on the normal interval instead.
+                print(f"[SolutionCounter] ingest_all failed, will retry: {e!r}", file=sys.stderr)
+                with self.lock:
+                    self.last_error = (time.time(), repr(e))
+                    self.computing = False
+                time.sleep(self.interval)
+                with self.lock:
+                    self.computing = True
+                continue
             now = time.time()
             with self.lock:
                 self.total = total
                 self.last_updated = now
+                self.last_error = None
                 self.computing = False
             record_solution_count(self.history_db_path, now, total)
             time.sleep(self.interval)
@@ -168,7 +217,7 @@ class SolutionCounter:
 
     def snapshot(self):
         with self.lock:
-            return self.total, self.last_updated, self.computing
+            return self.total, self.last_updated, self.computing, self.last_error
 
 
 def format_age(sqlite_datetime_str):
@@ -229,11 +278,27 @@ def format_eta(total, rate_info):
             f"{completion.strftime('%Y-%m-%d %H:%M UTC')}")
 
 
+def format_range_eta(remaining, rate_info):
+    label = "ETA (every range searched - exhaustive completion)"
+    if remaining <= 0:
+        return f"{label}: all ranges done"
+    if rate_info is None:
+        return f"{label}: not enough range-completion history yet"
+    rate, _n, _span = rate_info
+    if rate <= 0:
+        return f"{label}: unknown (current rate is zero)"
+    eta_seconds = remaining / rate
+    completion = datetime.now(timezone.utc) + timedelta(seconds=eta_seconds)
+    return (f"{label}: {format_duration(eta_seconds)} remaining, "
+            f"{remaining} range(s) to go - est. completion "
+            f"{completion.strftime('%Y-%m-%d %H:%M UTC')}")
+
+
 def render(conn, counter, width, history_db_path):
     running = list_running_rangesolvers()
     active = fetch_active_ranges(conn)
     counts, tracked = fetch_summary(conn)
-    total, last_updated, computing = counter.snapshot()
+    total, last_updated, computing, last_error = counter.snapshot()
     rate_info = compute_average_rate(history_db_path)
 
     lines = []
@@ -242,7 +307,11 @@ def render(conn, counter, width, history_db_path):
     lines.append(f"unsearched={counts.get('unsearched', 0)}  "
                  f"in_progress={counts.get('in_progress', 0)}  "
                  f"done={counts.get('done', 0)}  "
-                 f"solutions counted by finished ranges={tracked}")
+                 f"split={counts.get('split', 0)}  "
+                 f"solutions counted by finished/split ranges={tracked}")
+    if counts.get('held_for_split', 0):
+        lines.append(f"WARNING: {counts['held_for_split']} range(s) stuck in held_for_split - "
+                      f"splitter.py may have died mid-split; check its xterm.")
     if total is None:
         lines.append("unique solutions found: (computing initial total...)")
     else:
@@ -251,6 +320,13 @@ def render(conn, counter, width, history_db_path):
         lines.append(f"unique solutions found: {total}  (as of {age}){note}")
     lines.append(format_rate(rate_info))
     lines.append(format_eta(total, rate_info))
+    range_rate_info = compute_range_completion_rate(conn)
+    range_remaining = fetch_range_remaining(conn)
+    lines.append(format_range_eta(range_remaining, range_rate_info))
+    if last_error is not None:
+        err_ts, err_msg = last_error
+        lines.append(f"WARNING: solution ingest failed {int(time.time() - err_ts)}s ago, "
+                      f"retrying - total above may be stale: {err_msg}")
     lines.append("-" * width)
     lines.append(f"{'ID':>5}  {'PREFIX':<16}{'STATUS':<20}{'ELAPSED':>9}  CURRENT POSITION")
     lines.append("-" * width)

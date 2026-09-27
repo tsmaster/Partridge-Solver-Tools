@@ -18,6 +18,7 @@ import os
 import sqlite3
 import time
 
+import piece_geometry
 import solution
 import splitlog
 
@@ -46,6 +47,13 @@ def ensure_schema(db_path):
             last_scanned REAL NOT NULL
         );
     """)
+    # SQLite has no "ADD COLUMN IF NOT EXISTS" - a database created before this column existed
+    # needs an explicit check. Stores the L/I/other structural category (see piece_geometry.py)
+    # at ingest time so it never needs recomputing - classify_li_other.py backfills it for any
+    # row from before this column existed.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(solutions)")}
+    if "category" not in existing_columns:
+        conn.execute("ALTER TABLE solutions ADD COLUMN category TEXT;")
     conn.commit()
     conn.close()
 
@@ -112,10 +120,11 @@ def ingest_all(db_path, patterns):
         buffers, new_bytes = scan_new_blocks(filename, prior_bytes)
         for buf in buffers:
             h = solution.make_solution_from_lines(buf).get_hash()
+            category = piece_geometry.classify_detailed(h)
             conn.execute(
-                "INSERT OR IGNORE INTO solutions (hash, source_file, ingested_at) "
-                "VALUES (?, ?, ?)",
-                (h, abspath, now),
+                "INSERT OR IGNORE INTO solutions (hash, source_file, ingested_at, category) "
+                "VALUES (?, ?, ?, ?)",
+                (h, abspath, now, category),
             )
         conn.execute(
             "INSERT INTO ingested_files (filename, bytes_ingested, last_scanned) "

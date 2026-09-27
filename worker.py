@@ -14,11 +14,13 @@ detects (the pid no longer exists) and reclaims automatically - no separate clea
 """
 import argparse
 import os
+import random
 import re
 import signal
 import sqlite3
 import subprocess
 import sys
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(SCRIPT_DIR, "ranges.db")
@@ -28,8 +30,25 @@ RANGESOLVER = os.path.join(CLAUDE_DIR, "rangesolver")
 PROGRESS_RE = re.compile(r"\[t=([\d.]+)s\] depth=\s*(\d+) solutions=(\d+) path=(\d+)\s*$")
 DONE_RE = re.compile(r"Done\. (\d+) solution")
 
+DB_RETRY_ATTEMPTS = 6
+DB_RETRY_BASE_DELAY = 0.05  # seconds; backs off exponentially with jitter between attempts
+
+# Caps how many workers can simultaneously be claimed on ranges sharing the same length-5
+# lineage root (the original bootstrapped prefix a range - or any of its split descendants -
+# ultimately came from). Without this, a single bushy branch that keeps needing to be split
+# recaptures every worker that frees up (its freshly split children still sort first by the
+# range_start DESC ordering below, same as their parent did), starving the rest of the backlog
+# entirely - observed live 2026-09-23: a whole 6-worker pool sat on one lineage for 4+ hours
+# while 41,000+ other ranges made zero progress. This is deliberately not "no more than N
+# workers per split, ever" - it's per lineage ROOT, so splitting still helps: it just caps how
+# much of the total worker pool any single original branch can monopolize at once.
+MAX_WORKERS_PER_LINEAGE = 2
+
 _current_child = None
 _shutdown_requested = False
+_remote_host = None
+_remote_dir = None
+_ssh_key = None
 
 
 def handle_signal(signum, frame):
@@ -37,6 +56,31 @@ def handle_signal(signum, frame):
     _shutdown_requested = True
     if _current_child is not None:
         _current_child.terminate()
+
+
+def with_db_retry(fn, *args, **kwargs):
+    """Retries a SQLite operation on a transient 'database is locked'/'database is busy' error,
+    with exponential backoff plus jitter. The connection's own busy_timeout (set via
+    connect(timeout=...)) already retries internally for a while, but under enough concurrent
+    writers that can still not be enough - confirmed live, 2026-09-23: a worker crashed outright
+    on update_progress() with "database is locked" right after the per-lineage claim cap started
+    spreading work across many more concurrently-active ranges, so more workers hitting ranges.db
+    at once than before. Losing a whole worker over one transient lock is worse than a short,
+    bounded wait here. Deliberately narrow - only retries this specific error, raising immediately
+    for anything else, and re-raises on the final attempt too rather than silently giving up."""
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt == DB_RETRY_ATTEMPTS - 1:
+                raise
+            delay = DB_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, DB_RETRY_BASE_DELAY)
+            print(f"[worker {os.getpid()}] db {e} (attempt {attempt + 1}/{DB_RETRY_ATTEMPTS}), "
+                  f"retrying in {delay:.2f}s", file=sys.stderr)
+            time.sleep(delay)
 
 
 def pid_alive(pid):
@@ -52,6 +96,12 @@ def pid_alive(pid):
 def claim_range(conn):
     """Atomically claims one range: prefers reclaiming an orphaned in_progress row (dead or
     already-cleared pid) over starting fresh work, so interrupted ranges get finished first.
+    Among fresh unsearched work, prefers a range whose length-5 lineage root isn't already at
+    MAX_WORKERS_PER_LINEAGE active workers, falling back to the plain best candidate if every
+    option is already at the cap (so a worker is never left idle while any unsearched range
+    exists at all, even a fully-oversubscribed one). Within either tier, a range flagged priority>0
+    (see tools/rotate_priority.py - ranges predicted to contain a rotation of an already-found
+    solution) is preferred over the normal range_start DESC ordering.
     Returns a dict describing the claimed range, or None if nothing is available."""
     conn.execute("BEGIN IMMEDIATE;")
     try:
@@ -65,8 +115,16 @@ def claim_range(conn):
                 break
 
         target = orphaned or conn.execute(
+            "SELECT id, prefix, range_start, range_end, pid FROM ranges r "
+            "WHERE status='unsearched' AND ("
+            "  SELECT COUNT(*) FROM ranges "
+            "  WHERE status='in_progress' AND SUBSTR(prefix,1,5)=SUBSTR(r.prefix,1,5)"
+            ") < ? "
+            "ORDER BY priority DESC, range_start DESC LIMIT 1",
+            (MAX_WORKERS_PER_LINEAGE,),
+        ).fetchone() or conn.execute(
             "SELECT id, prefix, range_start, range_end, pid FROM ranges "
-            "WHERE status='unsearched' ORDER BY range_start DESC LIMIT 1"
+            "WHERE status='unsearched' ORDER BY priority DESC, range_start DESC LIMIT 1"
         ).fetchone()
 
         if target is None:
@@ -111,6 +169,11 @@ def update_progress(conn, range_id, path):
     conn.commit()
 
 
+def set_log_file(conn, range_id, log_name):
+    conn.execute("UPDATE ranges SET log_file=? WHERE id=?", (log_name, range_id))
+    conn.commit()
+
+
 def run_range(conn, work, use_inplace):
     """Runs one claimed range to completion (or interruption). Returns False if the caller
     should stop entirely (fatal launch failure, or a shutdown was requested), True to keep going.
@@ -122,25 +185,37 @@ def run_range(conn, work, use_inplace):
     global _current_child
     range_id = work["id"]
     log_name = f"soln_{work['prefix']}_{range_id}.txt"
-    conn.execute("UPDATE ranges SET log_file=? WHERE id=?", (log_name, range_id))
-    conn.commit()
+    with_db_retry(set_log_file, conn, range_id, log_name)
 
-    cmd = [
-        os.path.abspath(RANGESOLVER),
+    solver_args = [
         f"--start={work['start']}",
         f"--end={work['end']}",
         f"--log=Solutions/{log_name}",
         "--status=scroll",
     ]
-    print(f"[worker {os.getpid()}] claimed range {range_id} (prefix {work['prefix']}): "
-          f"--start={work['start']} --end={work['end']}", flush=True)
+
+    if _remote_host:
+        # The remote host mounts our Claude/Solutions/ directory (via SSHFS, onto
+        # <_remote_dir>/Solutions) so its rangesolver writes the log straight onto our real
+        # filesystem - set_log_file() above already stores just the bare filename, exactly as it
+        # would for a local run, so nothing else in this script needs to know or care that the
+        # range is being searched remotely.
+        remote_cmd = f"cd {_remote_dir} && ./rangesolver " + " ".join(solver_args)
+        cmd = ["ssh", "-i", _ssh_key, "-o", "BatchMode=yes", _remote_host, remote_cmd]
+        location = f"remote:{_remote_host}"
+    else:
+        cmd = [os.path.abspath(RANGESOLVER)] + solver_args
+        location = "local"
+
+    print(f"[worker {os.getpid()}] claimed range {range_id} (prefix {work['prefix']}, "
+          f"{location}): --start={work['start']} --end={work['end']}", flush=True)
 
     try:
         proc = subprocess.Popen(cmd, cwd=CLAUDE_DIR, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
     except OSError as e:
         print(f"[worker {os.getpid()}] failed to launch rangesolver: {e}", file=sys.stderr)
-        release_range(conn, range_id)
+        with_db_retry(release_range, conn, range_id)
         return False
 
     _current_child = proc
@@ -153,7 +228,7 @@ def run_range(conn, work, use_inplace):
         if m:
             elapsed, depth, solutions, path = m.groups()
             last_path = path
-            update_progress(conn, range_id, path)
+            with_db_retry(update_progress, conn, range_id, path)
             status = (f"[worker {os.getpid()}] range {range_id} (prefix {work['prefix']}) "
                       f"t={elapsed}s depth={depth} solutions={solutions} path={path}")
             if use_inplace:
@@ -178,17 +253,17 @@ def run_range(conn, work, use_inplace):
     _current_child = None
 
     if _shutdown_requested:
-        release_range(conn, range_id, reset_start=last_path)
+        with_db_retry(release_range, conn, range_id, reset_start=last_path)
         return False
 
     if proc.returncode == 0 and solutions_found is not None:
-        finish_range(conn, range_id, solutions_found)
+        with_db_retry(finish_range, conn, range_id, solutions_found)
         print(f"[worker {os.getpid()}] finished range {range_id}: "
               f"{solutions_found} solution(s).", flush=True)
     else:
         print(f"[worker {os.getpid()}] range {range_id} did not complete cleanly "
               f"(exit={proc.returncode}); leaving it for reclaim.", file=sys.stderr)
-        release_range(conn, range_id, reset_start=last_path)
+        with_db_retry(release_range, conn, range_id, reset_start=last_path)
 
     return True
 
@@ -203,12 +278,33 @@ def main():
                               "when stdout is a terminal, scroll otherwise (mirrors rangesolver's "
                               "own --status, though rangesolver itself is always run in scroll "
                               "mode internally so this script can parse its output).")
+    parser.add_argument("--remote-host", default=None,
+                         help="Run rangesolver over SSH on this host instead of locally (e.g. "
+                              "wheeljack.local). This script still runs locally and does all its "
+                              "usual claim/release/finish bookkeeping against --db directly - only "
+                              "the CPU-heavy rangesolver subprocess is launched remotely. Requires "
+                              "the remote host to have its own native rangesolver build in "
+                              "--remote-dir, with that directory's Solutions/ SSHFS-mounted back "
+                              "onto this machine's own Claude/Solutions/ so log files land in the "
+                              "right place with no extra copy step.")
+    parser.add_argument("--remote-dir", default="partridge_remote",
+                         help="Directory on the remote host containing its rangesolver build and "
+                              "the SSHFS-mounted Solutions/ (default: partridge_remote, i.e. "
+                              "~/partridge_remote as the ssh login's home-relative default).")
+    parser.add_argument("--ssh-key", default=os.path.expanduser("~/.ssh/partridge_worker_ed25519"),
+                         help="Private key for connecting to --remote-host (default: "
+                              "~/.ssh/partridge_worker_ed25519).")
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
         print(f"Error: database '{args.db}' does not exist - run bootstrap_ranges.py first.",
               file=sys.stderr)
         sys.exit(1)
+
+    global _remote_host, _remote_dir, _ssh_key
+    _remote_host = args.remote_host
+    _remote_dir = args.remote_dir
+    _ssh_key = args.ssh_key
 
     use_inplace = (args.status == "inplace") if args.status else sys.stdout.isatty()
 
@@ -219,12 +315,12 @@ def main():
     conn.execute("PRAGMA journal_mode=WAL;")
 
     while not _shutdown_requested:
-        work = claim_range(conn)
+        work = with_db_retry(claim_range, conn)
         if work is None:
             print(f"[worker {os.getpid()}] no ranges remain. Exiting.", flush=True)
             break
         if _shutdown_requested:
-            release_range(conn, work["id"])
+            with_db_retry(release_range, conn, work["id"])
             break
         if not run_range(conn, work, use_inplace):
             break

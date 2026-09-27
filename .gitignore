@@ -9,8 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Secrets - never commit (sms_notify.py's Twilio credentials)
+# Secrets - never commit (sms_notify.py's TextBelt/Twilio credentials)
 .env
+.env~
 
 # Runtime state for worker.py/bootstrap_ranges.py/dashboard.py - generated, not source
 ranges.db
@@ -25,3 +26,10 @@ solutions.db-shm
 watchers.db
 watchers.db-wal
 watchers.db-shm
+cron_sms.log
+.rotate_priority_state
+
+# Generated output from make_category_book.py - regenerable from solutions.db, not source
+category_book.pdf
+category_book_draft.pdf
+CategoryBookImages/
