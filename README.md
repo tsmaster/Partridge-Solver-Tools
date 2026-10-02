@@ -6,8 +6,9 @@ search of the "Partridge Puzzle" (tiling a 45x45 square exactly with one
 layer; the actual C++ search engine it drives lives in the companion
 repository, [Partridge-Puzzle-Solver (w/ Claude Code)](https://github.com/tsmaster/Partridge-Puzzle-Solver--w-Claude-Code-).
 
-The search this tooling ran is complete: **1,730,280 unique solutions**,
-an exact match to Matt Parker's cited figure. See that repo's
+The search this tooling ran is complete: **1,730,280 unique solutions**
+(216,285 if rotations and reflections of the same tiling are counted
+once), an exact match to Matt Parker's cited figure. See that repo's
 [`RESULTS.txt`](https://github.com/tsmaster/Partridge-Puzzle-Solver--w-Claude-Code-/blob/main/RESULTS.txt)
 for the full findings, and [`TODO.txt`](https://github.com/tsmaster/Partridge-Puzzle-Solver--w-Claude-Code-/blob/main/TODO.txt)
 for the complete development log both repos share.
